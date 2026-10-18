@@ -10,6 +10,7 @@ import {
   originalToolName,
 } from "./responses.ts";
 import { FORWARDED_PAYLOAD_POLICY, type ForwardedPayloadElision, type ForwardedPayloadReduction } from "./forwarded-payload-policy.ts";
+import { deepSeekThinkingModeActive } from "./index.ts";
 import { getString, isRecord } from "../utils.ts";
 
 type ChatContentPart = Record<string, unknown>;
@@ -708,6 +709,46 @@ const applyReasoning = (
   return { ok: true, value: undefined };
 };
 
+const isThinkingModeActive = (body: Record<string, unknown>, rawRecord: Record<string, unknown>, profile: ChatOnlyResponsesProfile): boolean => {
+  if (profile.id === "deepseek") {
+    return deepSeekThinkingModeActive(body.reasoning_effort, rawRecord.thinking);
+  }
+  return typeof body.reasoning_effort === "string" && body.reasoning_effort !== "none";
+};
+
+const applySamplingControls = (
+  body: Record<string, unknown>,
+  rawRecord: Record<string, unknown>,
+  profile: ChatOnlyResponsesProfile,
+  warnings: string[]
+): DeepSeekResponsesResult<void> => {
+  const thinkingActive = isThinkingModeActive(body, rawRecord, profile);
+
+  if (rawRecord.temperature !== undefined && rawRecord.temperature !== null) {
+    if (typeof rawRecord.temperature !== "number" || !Number.isFinite(rawRecord.temperature) || rawRecord.temperature < 0 || rawRecord.temperature > 2) {
+      return failure("temperature", "temperature must be a number between 0 and 2");
+    }
+    if (thinkingActive) {
+      warnings.push("temperature_ignored");
+    } else {
+      body.temperature = rawRecord.temperature;
+    }
+  }
+
+  if (rawRecord.top_p !== undefined && rawRecord.top_p !== null) {
+    if (typeof rawRecord.top_p !== "number" || !Number.isFinite(rawRecord.top_p) || rawRecord.top_p < 0 || rawRecord.top_p > 1) {
+      return failure("top_p", "top_p must be a number between 0 and 1");
+    }
+    if (thinkingActive) {
+      warnings.push("top_p_ignored");
+    } else {
+      body.top_p = rawRecord.top_p;
+    }
+  }
+
+  return { ok: true, value: undefined };
+};
+
 const applyTools = (
   body: Record<string, unknown>,
   rawRecord: Record<string, unknown>,
@@ -819,6 +860,7 @@ export const toDeepSeekResponsesChatBody = (
     toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     elisions: readonly ForwardedPayloadElision[];
+    warnings: readonly string[];
   }>
 > => {
   const canonical = profile.upstreamModelFor(requestedModel);
@@ -847,12 +889,15 @@ export const toDeepSeekResponsesChatBody = (
   if (!outputLimit.ok) return outputLimit;
   const reasoning = applyReasoning(body, rawRecord, profile);
   if (!reasoning.ok) return reasoning;
+  const warnings: string[] = [];
+  const sampling = applySamplingControls(body, rawRecord, profile, warnings);
+  if (!sampling.ok) return sampling;
   const toolNames = applyTools(body, rawRecord, profile);
   if (!toolNames.ok) return toolNames;
   // Only a tool-bearing request makes the provider require replayed reasoning.
   const continuationFailure = prepareExecutableToolMessages(body, rawRecord, messages.value, reduction.value, elisions);
   if (continuationFailure) return continuationFailure;
-  return { ok: true, value: { body, toolNames: toolNames.value.toolNames, customToolNames: toolNames.value.customToolNames, elisions } };
+  return { ok: true, value: { body, toolNames: toolNames.value.toolNames, customToolNames: toolNames.value.customToolNames, elisions, warnings } };
 };
 
 /**
