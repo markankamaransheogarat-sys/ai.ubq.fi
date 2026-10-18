@@ -266,6 +266,65 @@ test("chat projection: replayed reasoning is carried onto the following assistan
 
   // A reasoning item on its own leaves no message behind.
   assert.deepEqual(messagesOf([{ type: "reasoning", summary: [{ text: "orphan" }] }]), []);
+
+  // Pending reasoning does not survive a user-turn boundary to attach to a later assistant or tool turn.
+  assert.deepEqual(
+    messagesOf([
+      { type: "reasoning", summary: [{ text: "orphan" }] },
+      { type: "message", role: "user", content: "hello" },
+      { type: "message", role: "assistant", content: "answer" },
+    ]),
+    [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "answer" },
+    ]
+  );
+  assert.deepEqual(
+    messagesOf([
+      { type: "reasoning", summary: [{ text: "orphan" }] },
+      { type: "message", role: "user", content: "hello" },
+      { type: "function_call", call_id: "call-1", name: "lookup", arguments: "{}" },
+    ]),
+    [
+      { role: "user", content: "hello" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{ id: "call-1", type: "function", function: { name: "lookup", arguments: "{}" } }],
+      },
+    ]
+  );
+  assert.deepEqual(messagesOf([{ type: "reasoning", summary: [{ text: "orphan" }] }, "hello", { type: "message", role: "assistant", content: "answer" }]), [
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "answer" },
+  ]);
+  assert.deepEqual(
+    messagesOf([
+      { type: "reasoning", summary: [{ text: "orphan" }] },
+      { type: "agent_message", author: "worker", recipient: "root", content: [{ text: "hello" }] },
+      { type: "message", role: "assistant", content: "answer" },
+    ]),
+    [
+      { role: "user", content: "[agent message] worker -> root:\nhello" },
+      { role: "assistant", content: "answer" },
+    ]
+  );
+
+  // Reasoning produced with empty completion text (an orphan reasoning item)
+  // followed by a user turn and an assistant turn does not attach to that assistant turn.
+  const emptyCompletionBody = bodyOf({
+    input: [
+      { type: "reasoning", content: [{ type: "reasoning_text", text: "thought without completion text" }] },
+      { type: "message", role: "user", content: "follow-up question" },
+      { type: "message", role: "assistant", content: "answer" },
+    ],
+  });
+  const emptyCompletionMessages = bodyMessages(emptyCompletionBody.body);
+  assert.deepEqual(emptyCompletionMessages, [
+    { role: "user", content: "follow-up question" },
+    { role: "assistant", content: "answer" },
+  ]);
+  assert.equal("reasoning_content" in emptyCompletionMessages[1], false);
 });
 
 test("chat projection: the request body carries the official model and the optional fields", () => {
