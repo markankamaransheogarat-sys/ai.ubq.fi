@@ -1,7 +1,7 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
 
-import { meteredCodexModelRecord, openRouterCodexModels } from "../src/catalog/models.ts";
+import { meteredCodexModelRecord, openRouterCodexModels, withDeepSeekOfficialModels } from "../src/catalog/models.ts";
 import { fetchOpenRouterModels, openRouterModelsSnapshot, resetOpenRouterModelsCacheForTest } from "../src/models/openrouter-models.ts";
 
 const modelId = "~anthropic/claude-opus-latest";
@@ -58,4 +58,44 @@ test("codex native catalog: uploaded Codex effort order and default retain prece
     assert.equal(row.default_reasoning_level, "max");
     assert.deepEqual(uploaded.supported_reasoning_levels, uploadedLevels);
   });
+});
+
+test("codex native catalog: official DeepSeek Pro tiers and default win when paid row is present first", () => {
+  const originalKey = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "test-deepseek-key";
+  try {
+    // Generic paid discovery row for deepseek-v4-pro with generic/empty reasoning tiers
+    const paidRow = {
+      slug: "deepseek-v4-pro",
+      display_name: "DeepSeek V4 Pro (Paid)",
+      owned_by: "moonshot",
+      supported_endpoint_types: ["openai-response"],
+      supported_reasoning_levels: [{ effort: "medium", description: "Medium" }],
+      default_reasoning_level: "medium",
+      context_window: 128000,
+    };
+
+    const initial = [paidRow];
+    const result = withDeepSeekOfficialModels(initial);
+
+    const proRow = result.find((model) => model.slug === "deepseek-v4-pro");
+    assert.ok(proRow, "deepseek-v4-pro must be present in the catalog");
+
+    // Must not duplicate the row
+    assert.equal(result.filter((model) => model.slug === "deepseek-v4-pro").length, 1);
+
+    // Official low/high/max tiers and default "high" must win over the generic paid row
+    assert.deepEqual(
+      (proRow.supported_reasoning_levels as { effort: string }[]).map((level) => level.effort),
+      ["none", "low", "high", "max"],
+      "official DeepSeek reasoning tiers win when paid row is present first"
+    );
+    assert.equal(proRow.default_reasoning_level, "high");
+
+    // Existing context window is preserved
+    assert.equal(proRow.context_window, 128000);
+  } finally {
+    if (originalKey === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = originalKey;
+  }
 });

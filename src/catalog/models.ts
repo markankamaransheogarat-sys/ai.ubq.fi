@@ -289,15 +289,32 @@ const deepSeekOfficialCodexModels = (): Record<string, unknown>[] => {
 };
 
 /**
- * Appends the official ids that the stored catalog does not already advertise.
- * A discovery source may already publish the legacy alias with equivalent
- * tiers, and replacing it would churn that record for no behavioral gain.
+ * Merges the official DeepSeek models into the catalog. When paid discovery has
+ * already published an official id (e.g. `deepseek-v4-pro`), the official tiers
+ * and default reasoning level win so the model advertises its official low/high/max
+ * tiers instead of third-party metadata. Missing official ids are appended.
  */
 const withDeepSeekOfficialModels = (models: readonly Record<string, unknown>[]): Record<string, unknown>[] => {
   const configured = deepSeekOfficialCodexModels();
   if (!configured.length) return [...models];
-  const present = new Set(models.map((model) => getString(model.slug) ?? getString(model.id) ?? ""));
-  return [...models, ...configured.filter((model) => !present.has(String(model.slug)))];
+  const officialBySlug = new Map(configured.map((model) => [String(model.slug), model]));
+  const seen = new Set<string>();
+  const merged = models.map((model) => {
+    const slug = getString(model.slug) ?? getString(model.id);
+    if (!slug) return model;
+    const official = officialBySlug.get(slug);
+    if (!official) return model;
+    seen.add(slug);
+    return {
+      ...model,
+      supported_reasoning_levels: official.supported_reasoning_levels,
+      default_reasoning_level: official.default_reasoning_level,
+      ...(model.context_window !== undefined ? {} : { context_window: official.context_window }),
+      ...(model.max_context_window !== undefined ? {} : { max_context_window: official.max_context_window }),
+    };
+  });
+  const unmerged = configured.filter((model) => !seen.has(String(model.slug)));
+  return [...merged, ...unmerged];
 };
 
 /**
