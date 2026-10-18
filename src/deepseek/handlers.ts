@@ -13,7 +13,7 @@ import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload } from "./respon
 import { logForwardedPayloadElisions, toDeepSeekResponsesChatBody } from "./chat-projection.ts";
 import { readBoundedResponseBody } from "../bounded-response-body.ts";
 import { json, openaiError } from "../http.ts";
-import { BUFFERED_INFERENCE_DEADLINE_MS } from "../inference-deadline.ts";
+import { BUFFERED_INFERENCE_DEADLINE_MS, createStreamFirstEventDeadline } from "../inference-deadline.ts";
 import { isRecord } from "../utils.ts";
 import { type UsageContext, extractChatUsageTokens, recordCompletionUsage, recordRequestUsage, recordStreamTerminalType } from "../openai-telemetry.ts";
 import { markChatSemanticOutput } from "../chat/stream-translation.ts";
@@ -435,7 +435,9 @@ export const dispatchDeepSeekUpstream = async (
   usageContext: UsageContext | undefined
 ): Promise<DeepSeekDispatchResult> => {
   const downstreamSignal = downstreamSignalFor(req, usageContext);
-  const requestSignal = inferenceSignal(req, usageContext);
+  const isStream = body.stream === true;
+  const streamFirstEventDeadline = isStream ? createStreamFirstEventDeadline(downstreamSignal) : null;
+  const requestSignal = streamFirstEventDeadline?.signal ?? inferenceSignal(req, usageContext);
   let upstream: Response;
   let bodyDiagnostic: Record<string, unknown> | undefined;
   try {
@@ -455,15 +457,18 @@ export const dispatchDeepSeekUpstream = async (
       sentinelUpstreamRecorder: usageContext?.sentinelUpstreamRecorder,
     });
   } catch (error) {
+    streamFirstEventDeadline?.clear();
     return { ok: false, response: await respondDeepSeekChatDispatchFailure(error, downstreamSignal, usageContext) };
   }
 
+  streamFirstEventDeadline?.clear();
   const providerRequestId = getDeepSeekProviderRequestId(upstream);
   if (usageContext?.responseTelemetry) usageContext.responseTelemetry.providerRequestId = providerRequestId;
   if (!upstream.ok) {
     return { ok: false, response: await respondDeepSeekChatUpstreamHttpFailure(upstream, requestSignal, providerRequestId, usageContext, bodyDiagnostic) };
   }
-  return { ok: true, upstream, providerRequestId, requestSignal, downstreamSignal };
+  const streamSignal = isStream ? downstreamSignal : requestSignal;
+  return { ok: true, upstream, providerRequestId, requestSignal: streamSignal, downstreamSignal };
 };
 
 export const handleDeepSeekChatCompletions = async (
