@@ -251,6 +251,53 @@ test("the official DeepSeek ids are cataloged as their own provider category", a
   }
 });
 
+test("a duplicate id discovered by paid discovery first still receives the official provider hint", async () => {
+  const originalFetch = globalThis.fetch;
+  delete process.env.CEREBRAS_API_KEY;
+  delete process.env.LITHOSAI_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  process.env.DEEPSEEK_API_KEY = "fixture-deepseek-key";
+  process.env.METERED_API_KEY = "fixture-metered-key";
+
+  // Paid discovery (metered/openlux) returns deepseek-v4-flash first, without rich metadata
+  setMeteredModelsFetchForTest(() =>
+    Promise.resolve(
+      Response.json({
+        data: [{ id: "deepseek-v4-flash", owned_by: "openlux", supported_endpoint_types: ["openai-response", "openai"] }],
+      })
+    )
+  );
+
+  globalThis.fetch = createFetchMock(() => Promise.reject(new Error("Provider discovery is unavailable in this fixture")));
+  try {
+    const catalog = await buildModelCatalogSnapshot();
+    const row = catalog.models.find((model) => model.id === "deepseek-v4-flash");
+    assert.ok(row, "deepseek-v4-flash must be present in the catalog");
+
+    // Both openlux (paid discovery) and deepseek (official route) are listed as providers
+    assert.deepEqual(
+      row.providers.map((p) => p.id),
+      ["openlux", "deepseek"],
+      "both the earlier paid discovery and the later official route are listed as providers"
+    );
+
+    // Official route hint overrides/populates the row metadata
+    assert.equal(row.context_source, "provider_discovery");
+    assert.equal(row.context_window_tokens, 1_000_000);
+    assert.equal(row.reasoning_source, "provider_discovery");
+    assert.deepEqual(row.supported_reasoning_levels, ["none", "low", "high", "max"]);
+    assert.equal(row.default_reasoning_effort, "high");
+  } finally {
+    setMeteredModelsFetchForTest(null);
+    resetMeteredModelsCacheForTest();
+    resetSurplusModelsCacheForTest();
+    resetOpenRouterModelsCacheForTest();
+    globalThis.fetch = originalFetch;
+    delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.METERED_API_KEY;
+  }
+});
+
 test("the gateway waterfall model is cataloged with one provider row per usable hop in cost-first order", async () => {
   delete process.env.DEEPSEEK_API_KEY;
   delete process.env.LITHOSAI_API_KEY;

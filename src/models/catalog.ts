@@ -28,6 +28,7 @@ import {
   type ModelMetadataHint,
   type ModelMetadataSource,
   type ModelMetadataSources,
+  type ResolvedModelMetadata,
 } from "./metadata.ts";
 import { warmOpenRouterModels, openRouterModelsSnapshot } from "./openrouter-models.ts";
 import { getString, isRecord } from "../utils.ts";
@@ -197,6 +198,40 @@ const providerSupportedEndpointPaths = (supportedEndpointTypes: readonly string[
 
 const catalogAvailabilityStatus = (available: unknown): "available" | "unavailable" => (available ? "available" : "unavailable");
 
+const snapshotSources = new WeakMap<Map<string, PublicModelCatalogEntry>, Map<string, ModelMetadataSources>>();
+
+const getModelSources = (models: Map<string, PublicModelCatalogEntry>): Map<string, ModelMetadataSources> => {
+  let sources = snapshotSources.get(models);
+  if (!sources) {
+    sources = new Map();
+    snapshotSources.set(models, sources);
+  }
+  return sources;
+};
+
+const applyResolvedModelMetadata = (entry: PublicModelCatalogEntry, resolved: ResolvedModelMetadata): void => {
+  if (resolved.context_window_tokens === null) delete entry.context_window_tokens;
+  else entry.context_window_tokens = resolved.context_window_tokens;
+
+  if (resolved.max_context_window_tokens === null) delete entry.max_context_window_tokens;
+  else entry.max_context_window_tokens = resolved.max_context_window_tokens;
+
+  if (resolved.auto_compact_token_limit_tokens === null) delete entry.auto_compact_token_limit_tokens;
+  else entry.auto_compact_token_limit_tokens = resolved.auto_compact_token_limit_tokens;
+
+  if (resolved.effective_context_window_percent === null) delete entry.effective_context_window_percent;
+  else entry.effective_context_window_percent = resolved.effective_context_window_percent;
+
+  if (resolved.supported_reasoning_levels === null) delete entry.supported_reasoning_levels;
+  else entry.supported_reasoning_levels = resolved.supported_reasoning_levels;
+
+  if (resolved.default_reasoning_effort === null) delete entry.default_reasoning_effort;
+  else entry.default_reasoning_effort = resolved.default_reasoning_effort;
+
+  entry.context_source = resolved.context_source;
+  entry.reasoning_source = resolved.reasoning_source;
+};
+
 /**
  * One catalog row for one model id. Metadata comes from `resolveModelMetadata`,
  * so a row carries a value only when a source actually published one, and it
@@ -204,21 +239,14 @@ const catalogAvailabilityStatus = (available: unknown): "available" | "unavailab
  * curated guess.
  */
 const publicModelCatalogEntry = (id: string, provider: PublicModelProvider, created: unknown, sources: ModelMetadataSources = {}): PublicModelCatalogEntry => {
-  const resolved = resolveModelMetadata(id, sources);
   const createdSeconds = typeof created === "number" && Number.isSafeInteger(created) && created > 0 ? created : null;
-  return {
+  const entry: PublicModelCatalogEntry = {
     id,
     providers: [provider],
     ...(createdSeconds === null ? {} : { created: createdSeconds }),
-    ...(resolved.context_window_tokens === null ? {} : { context_window_tokens: resolved.context_window_tokens }),
-    ...(resolved.max_context_window_tokens === null ? {} : { max_context_window_tokens: resolved.max_context_window_tokens }),
-    ...(resolved.auto_compact_token_limit_tokens === null ? {} : { auto_compact_token_limit_tokens: resolved.auto_compact_token_limit_tokens }),
-    ...(resolved.effective_context_window_percent === null ? {} : { effective_context_window_percent: resolved.effective_context_window_percent }),
-    ...(resolved.supported_reasoning_levels === null ? {} : { supported_reasoning_levels: resolved.supported_reasoning_levels }),
-    ...(resolved.default_reasoning_effort === null ? {} : { default_reasoning_effort: resolved.default_reasoning_effort }),
-    context_source: resolved.context_source,
-    reasoning_source: resolved.reasoning_source,
   };
+  applyResolvedModelMetadata(entry, resolveModelMetadata(id, sources));
+  return entry;
 };
 
 const addPublicModelCatalogEntry = (
@@ -228,15 +256,28 @@ const addPublicModelCatalogEntry = (
   created: unknown = null,
   sources: ModelMetadataSources = {}
 ): void => {
+  const modelSources = getModelSources(models);
+  const previousSources = modelSources.get(id) ?? {};
+  const mergedSources: ModelMetadataSources = {
+    ...previousSources,
+    ...sources,
+    provider: sources.provider ?? previousSources.provider ?? null,
+    codex: sources.codex ?? previousSources.codex ?? null,
+    codexSubscription: sources.codexSubscription ?? previousSources.codexSubscription ?? null,
+    openRouter: sources.openRouter ?? previousSources.openRouter ?? null,
+  };
+  modelSources.set(id, mergedSources);
+
   const existing = models.get(id);
   if (existing) {
     existing.providers.push(provider);
     if (existing.created === undefined && typeof created === "number" && Number.isSafeInteger(created) && created > 0) {
       existing.created = created;
     }
+    applyResolvedModelMetadata(existing, resolveModelMetadata(id, mergedSources));
     return;
   }
-  models.set(id, publicModelCatalogEntry(id, provider, created, sources));
+  models.set(id, publicModelCatalogEntry(id, provider, created, mergedSources));
 };
 
 /** Raw uploaded records by id, so the catalog can read metadata `normalizeModelList` drops. */
