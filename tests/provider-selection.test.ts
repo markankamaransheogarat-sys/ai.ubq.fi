@@ -282,6 +282,45 @@ test("the routing selection read is cached, primed by a save, and fails open", a
   });
 });
 
+test("an in-flight loadProviderSelectionCached does not overwrite a newer saved value", async () => {
+  const kv = new SelectionKv();
+  kv.seedSelection(["codex"], 1_000);
+  await withKv(kv, async () => {
+    let unblockRead: () => void = () => {};
+    const readBlocked = new Promise<void>((resolve) => {
+      unblockRead = resolve;
+    });
+    const originalGet = kv.get.bind(kv);
+    let readWaitStarted: () => void = () => {};
+    const readWait = new Promise<void>((resolve) => {
+      readWaitStarted = resolve;
+    });
+
+    kv.get = async <T>(key: KvKey, options?: { consistency?: "strong" | "eventual" }) => {
+      readWaitStarted();
+      await readBlocked;
+      return originalGet<T>(key, options);
+    };
+
+    // 1. Start cached load (read is now in-flight and blocked at KV get)
+    const inFlightRead = loadProviderSelectionCached();
+    await readWait;
+
+    // 2. An admin saves a new selection while read is still in flight, priming the cache
+    const saved = await storeProviderSelection(kv as unknown as Kv, ["openlux"]);
+    assert.ok(saved);
+    assert.deepEqual(await loadProviderSelectionCached(), { provider_ids: ["openlux"], updated_at_ms: saved.updated_at_ms });
+
+    // 3. Now let the older in-flight read resolve
+    unblockRead();
+    const readResult = await inFlightRead;
+
+    // 4. The read returns the newer saved value and the cache retains the saved selection
+    assert.deepEqual(readResult, { provider_ids: ["openlux"], updated_at_ms: saved.updated_at_ms });
+    assert.deepEqual(await loadProviderSelectionCached(), { provider_ids: ["openlux"], updated_at_ms: saved.updated_at_ms });
+  });
+});
+
 // ── Admin API ────────────────────────────────────────────────────────────────
 
 const catalogFixture = () => ({
