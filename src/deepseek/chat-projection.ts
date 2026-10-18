@@ -7,7 +7,6 @@ import {
   type DeepSeekResponsesResult,
   type OriginalToolName,
   failure,
-  originalToolName,
 } from "./responses.ts";
 import { FORWARDED_PAYLOAD_POLICY, type ForwardedPayloadElision, type ForwardedPayloadReduction } from "./forwarded-payload-policy.ts";
 import { getString, isRecord } from "../utils.ts";
@@ -89,12 +88,32 @@ const chatContentFromResponseParts = (
   return boundedChatContent(images, contentPath, reduction, elisions);
 };
 
-const chatToolCallItem = (item: Record<string, unknown>): DeepSeekResponsesResult<Record<string, unknown>> => {
+const resolveChatToolName = (name: string, namespace: string | null, toolNames: ReadonlyMap<string, OriginalToolName>): string => {
+  if (namespace !== null) {
+    for (const [chatName, original] of toolNames) {
+      if (original.name === name && original.namespace === namespace) return chatName;
+    }
+    if (toolNames.has(name)) return name;
+    return `${namespace}_${name}`;
+  }
+  for (const [chatName, original] of toolNames) {
+    if (original.name === name && original.namespace === null) return chatName;
+  }
+  if (toolNames.has(name)) return name;
+  return name;
+};
+
+const chatToolCallItem = (
+  item: Record<string, unknown>,
+  toolNames?: ReadonlyMap<string, OriginalToolName>
+): DeepSeekResponsesResult<Record<string, unknown>> => {
   const callId = getString(item.call_id) ?? getString(item.id);
   const name = getString(item.name);
   if (!callId || !name) return failure("input", "function_call items require call_id and name");
+  const namespace = getString(item.namespace);
+  const chatName = toolNames ? resolveChatToolName(name, namespace, toolNames) : namespace ? `${namespace}_${name}` : name;
   const args = typeof item.arguments === "string" ? item.arguments : "{}";
-  return { ok: true, value: { id: callId, type: "function", function: { name, arguments: args } } };
+  return { ok: true, value: { id: callId, type: "function", function: { name: chatName, arguments: args } } };
 };
 
 const forwardedByteLength = (value: string): number => new TextEncoder().encode(value).byteLength;
@@ -298,12 +317,16 @@ const chatToolResultItems = (
  * requires. Without this translation Codex rejected the whole request:
  * "input item type 'custom_tool_call' is not supported".
  */
-const chatCustomToolCallItem = (item: Record<string, unknown>): DeepSeekResponsesResult<Record<string, unknown>> => {
+const chatCustomToolCallItem = (
+  item: Record<string, unknown>,
+  toolNames?: ReadonlyMap<string, OriginalToolName>
+): DeepSeekResponsesResult<Record<string, unknown>> => {
   const callId = getString(item.call_id) ?? getString(item.id);
   const name = getString(item.name);
   if (!callId || !name) return failure("input", "custom_tool_call items require call_id and name");
+  const chatName = toolNames ? resolveChatToolName(name, null, toolNames) : name;
   const input = typeof item.input === "string" ? item.input : "";
-  return { ok: true, value: { id: callId, type: "function", function: { name, arguments: JSON.stringify({ input }) } } };
+  return { ok: true, value: { id: callId, type: "function", function: { name: chatName, arguments: JSON.stringify({ input }) } } };
 };
 
 /**
@@ -435,7 +458,8 @@ const appendInputItem = (
   pending: { reasoning: string },
   path: string,
   reduction: ForwardedPayloadReduction,
-  elisions: ForwardedPayloadElision[]
+  elisions: ForwardedPayloadElision[],
+  toolNames?: ReadonlyMap<string, OriginalToolName>
 ): DeepSeekResponsesResult<void> => {
   if (typeof rawItem === "string") {
     const content = boundedForwardedText(rawItem, path, reduction, elisions);
@@ -453,7 +477,7 @@ const appendInputItem = (
     case "function_call":
     case "custom_tool_call": {
       // Freeform calls carry raw text; function calls carry JSON arguments.
-      const call = type === "custom_tool_call" ? chatCustomToolCallItem(rawItem) : chatToolCallItem(rawItem);
+      const call = type === "custom_tool_call" ? chatCustomToolCallItem(rawItem, toolNames) : chatToolCallItem(rawItem, toolNames);
       if (!call.ok) return call;
       appendToolCall(messages, call.value, pending);
       return { ok: true, value: undefined };
@@ -482,7 +506,8 @@ export const toDeepSeekChatMessages = (
   input: unknown,
   instructions: string | null,
   reduction: ForwardedPayloadReduction = "reduce",
-  elisions: ForwardedPayloadElision[] = []
+  elisions: ForwardedPayloadElision[] = [],
+  toolNames?: ReadonlyMap<string, OriginalToolName>
 ): DeepSeekResponsesResult<Record<string, unknown>[]> => {
   const messages: Record<string, unknown>[] = [];
   if (instructions) {
@@ -503,7 +528,7 @@ export const toDeepSeekChatMessages = (
 
   const pending = { reasoning: "" };
   for (let index = 0; index < input.length; index += 1) {
-    const appended = appendInputItem(messages, input[index], pending, `input[${index}]`, reduction, elisions);
+    const appended = appendInputItem(messages, input[index], pending, `input[${index}]`, reduction, elisions, toolNames);
     if (!appended.ok) return appended;
   }
   return { ok: true, value: messages };
@@ -665,7 +690,8 @@ const toChatToolChoice = (value: unknown, toolNames: ReadonlyMap<string, Origina
   if (!isRecord(value) || Array.isArray(value)) return failure("tool_choice", "tool_choice must be a string or an object");
   const name = getString(value.name) ?? (isRecord(value.function) ? getString(value.function.name) : null);
   if (!name) return failure("tool_choice.name", "a named tool_choice requires a name");
-  return { ok: true, value: { type: "function", function: { name: originalToolName(name, toolNames) } } };
+  const namespace = getString(value.namespace) ?? (isRecord(value.function) ? getString(value.function.namespace) : null);
+  return { ok: true, value: { type: "function", function: { name: resolveChatToolName(name, namespace, toolNames) } } };
 };
 
 /** Responses nests the output format under `text.format`; Chat has one flat field. */
@@ -711,11 +737,19 @@ const applyReasoning = (
 const applyTools = (
   body: Record<string, unknown>,
   rawRecord: Record<string, unknown>,
-  profile: ChatOnlyResponsesProfile
+  profile: ChatOnlyResponsesProfile,
+  toolsResult?: DeepSeekResponsesResult<
+    Readonly<{ tools: Record<string, unknown>[]; toolNames: ReadonlyMap<string, OriginalToolName>; customToolNames: ReadonlySet<string> }>
+  >
 ): DeepSeekResponsesResult<Readonly<{ toolNames: ReadonlyMap<string, OriginalToolName>; customToolNames: ReadonlySet<string> }>> => {
   const toolNames = new Map<string, OriginalToolName>();
   let customToolNames: ReadonlySet<string> = new Set();
-  if (rawRecord.tools !== undefined) {
+  if (toolsResult !== undefined) {
+    if (!toolsResult.ok) return toolsResult;
+    if (toolsResult.value.tools.length) body.tools = toolsResult.value.tools;
+    for (const [chatName, original] of toolsResult.value.toolNames) toolNames.set(chatName, original);
+    customToolNames = toolsResult.value.customToolNames;
+  } else if (rawRecord.tools !== undefined) {
     const tools = toChatTools(rawRecord.tools);
     if (!tools.ok) return tools;
     if (tools.value.tools.length) body.tools = tools.value.tools;
@@ -827,7 +861,9 @@ export const toDeepSeekResponsesChatBody = (
   if (!reduction.ok) return reduction;
   const instructions = typeof rawRecord.instructions === "string" && rawRecord.instructions.trim() ? rawRecord.instructions : null;
   const elisions: ForwardedPayloadElision[] = [];
-  const messages = toDeepSeekChatMessages(rawRecord.input, instructions, reduction.value, elisions);
+  const toolsResult = rawRecord.tools !== undefined ? toChatTools(rawRecord.tools) : undefined;
+  const toolNamesMap = toolsResult?.ok ? toolsResult.value.toolNames : undefined;
+  const messages = toDeepSeekChatMessages(rawRecord.input, instructions, reduction.value, elisions, toolNamesMap);
   if (!messages.ok) return messages;
   if (!messages.value.length) return failure("input", "input must contain at least one message");
 
@@ -847,7 +883,7 @@ export const toDeepSeekResponsesChatBody = (
   if (!outputLimit.ok) return outputLimit;
   const reasoning = applyReasoning(body, rawRecord, profile);
   if (!reasoning.ok) return reasoning;
-  const toolNames = applyTools(body, rawRecord, profile);
+  const toolNames = applyTools(body, rawRecord, profile, toolsResult);
   if (!toolNames.ok) return toolNames;
   // Only a tool-bearing request makes the provider require replayed reasoning.
   const continuationFailure = prepareExecutableToolMessages(body, rawRecord, messages.value, reduction.value, elisions);

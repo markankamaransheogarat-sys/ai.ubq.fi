@@ -428,7 +428,7 @@ test("chat projection: tool choice and response format are translated or rejecte
     message: "tool_choice must be a string or an object",
   });
 
-  // A named choice maps the renamed tool back to its original name.
+  // A named choice preserves the synthesized chat name for a namespaced tool.
   const renamed = bodyOf({
     input: "hi",
     tools: [
@@ -438,7 +438,7 @@ test("chat projection: tool choice and response format are translated or rejecte
     reasoning: { effort: "none" },
     tool_choice: { type: "function", function: { name: "ns_lookup" } },
   });
-  assert.deepEqual(renamed.body.tool_choice, { type: "function", function: { name: "lookup" } });
+  assert.deepEqual(renamed.body.tool_choice, { type: "function", function: { name: "ns_lookup" } });
   assert.deepEqual(bodyOf({ input: "hi", reasoning: { effort: "none" }, tool_choice: { name: "plain" } }).body.tool_choice, {
     type: "function",
     function: { name: "plain" },
@@ -888,4 +888,80 @@ test("deepseek wire: provider request ids and dispatch failures keep their ident
     fetcher: () => Promise.resolve(new Response(JSON.stringify({ id: "chatcmpl-1" }), { status: 200 })),
   });
   assert.equal(healthy.status, 200);
+});
+
+test("chat projection: preserves namespace identity when top-level and namespace tool names collide", () => {
+  const tools = [
+    { type: "function", name: "now" },
+    { type: "namespace", name: "clock", tools: [{ type: "function", name: "now" }] },
+  ];
+
+  // Replaying tool calls in input resolves the correct synthesized name.
+  const history = [
+    { type: "message", role: "user", content: "what time is it?" },
+    { type: "function_call", id: "fc_1", call_id: "call_top", name: "now", arguments: "{}" },
+    { type: "function_call", id: "fc_2", call_id: "call_ns", namespace: "clock", name: "now", arguments: "{}" },
+  ];
+
+  const projectedHistory = bodyOf({ input: history, tools, reasoning: { effort: "none" } });
+  const messages = bodyMessages(projectedHistory.body);
+  const assistantTurn = messages.find((m) => m.role === "assistant" && Array.isArray(m.tool_calls));
+  assert.ok(assistantTurn, "assistant turn must contain tool calls");
+  const calls = assistantTurn.tool_calls as Record<string, unknown>[];
+  assert.deepEqual(calls, [
+    { id: "call_top", type: "function", function: { name: "now", arguments: "{}" } },
+    { id: "call_ns", type: "function", function: { name: "clock_now", arguments: "{}" } },
+  ]);
+
+  // Tool choice by top-level name maps to the top-level chat name.
+  const topChoice = bodyOf({ input: "hi", tools, reasoning: { effort: "none" }, tool_choice: { type: "function", function: { name: "now" } } });
+  assert.deepEqual(topChoice.body.tool_choice, { type: "function", function: { name: "now" } });
+
+  // Tool choice specifying namespace maps to synthesized clock_now.
+  const nsChoice = bodyOf({ input: "hi", tools, reasoning: { effort: "none" }, tool_choice: { type: "function", namespace: "clock", name: "now" } });
+  assert.deepEqual(nsChoice.body.tool_choice, { type: "function", function: { name: "clock_now" } });
+
+  // Tool choice specifying namespace inside function object maps to synthesized clock_now.
+  const nsFuncChoice = bodyOf({
+    input: "hi",
+    tools,
+    reasoning: { effort: "none" },
+    tool_choice: { type: "function", function: { namespace: "clock", name: "now" } },
+  });
+  assert.deepEqual(nsFuncChoice.body.tool_choice, { type: "function", function: { name: "clock_now" } });
+
+  // Tool choice referring directly to the synthesized name clock_now.
+  const directChoice = bodyOf({ input: "hi", tools, reasoning: { effort: "none" }, tool_choice: { type: "function", function: { name: "clock_now" } } });
+  assert.deepEqual(directChoice.body.tool_choice, { type: "function", function: { name: "clock_now" } });
+
+  // Declaration order reversed: namespace member declared before top-level function.
+  const reversedTools = [
+    { type: "namespace", name: "clock", tools: [{ type: "function", name: "now" }] },
+    { type: "function", name: "now" },
+  ];
+  const reversedReplay = bodyOf({ input: history, tools: reversedTools, reasoning: { effort: "none" } });
+  const reversedMessages = bodyMessages(reversedReplay.body);
+  const reversedAssistant = reversedMessages.find((m) => m.role === "assistant" && Array.isArray(m.tool_calls));
+  assert.ok(reversedAssistant, "assistant turn must contain tool calls");
+  const reversedCalls = reversedAssistant.tool_calls as Record<string, unknown>[];
+  assert.deepEqual(reversedCalls, [
+    { id: "call_top", type: "function", function: { name: "now_2", arguments: "{}" } },
+    { id: "call_ns", type: "function", function: { name: "now", arguments: "{}" } },
+  ]);
+
+  const reversedNsChoice = bodyOf({
+    input: "hi",
+    tools: reversedTools,
+    reasoning: { effort: "none" },
+    tool_choice: { type: "function", namespace: "clock", name: "now" },
+  });
+  assert.deepEqual(reversedNsChoice.body.tool_choice, { type: "function", function: { name: "now" } });
+
+  const reversedTopChoice = bodyOf({
+    input: "hi",
+    tools: reversedTools,
+    reasoning: { effort: "none" },
+    tool_choice: { type: "function", function: { name: "now" } },
+  });
+  assert.deepEqual(reversedTopChoice.body.tool_choice, { type: "function", function: { name: "now_2" } });
 });
